@@ -1,0 +1,58 @@
+# Single-host deployment. The web port is loopback-bound; use a TLS reverse proxy for public access.
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://firstproof:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD (URL-safe)}@db:5432/firstproof
+    FAULTLAB_URL: http://faultlab:8001
+    FAULTLAB_TOKEN: ${FAULTLAB_TOKEN:?Generate FAULTLAB_TOKEN}
+  restart: unless-stopped
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: firstproof
+      POSTGRES_USER: firstproof
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U firstproof -d firstproof']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    command: [python, -m, alembic, upgrade, head]
+    restart: 'no'
+    depends_on:
+      db: {condition: service_healthy}
+  web:
+    <<: *app
+    ports: ['127.0.0.1:8000:8000']
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  faultlab:
+    build: .
+    environment:
+      FAULTLAB_TOKEN: ${FAULTLAB_TOKEN:?Generate FAULTLAB_TOKEN}
+    restart: unless-stopped
+    command: [uvicorn, 'firstproof.faultlab:app', --host, '0.0.0.0', --port, '8001', --no-access-log]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  worker:
+    <<: *app
+    command: [python, -m, firstproof.worker]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      faultlab: {condition: service_healthy}
+volumes:
+  pgdata:

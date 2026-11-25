@@ -1,0 +1,25 @@
+name: FirstProof checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: {POSTGRES_USER: firstproof, POSTGRES_PASSWORD: test-only, POSTGRES_DB: firstproof}
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: python -m pip install '.[dev]'
+      - run: python -m compileall -q firstproof
+      - run: pytest -q
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://firstproof:test-only@localhost:5432/firstproof
+      - run: bandit -r firstproof -ll
+      - run: pip-audit
+      - run: docker build -t firstproof:ci .
