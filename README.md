@@ -1,6 +1,6 @@
 # FirstProof
 
-FirstProof is a release verification workbench built around Flagsmith Experimentation. It runs controlled HTTP workloads against two implementations, records the results, and helps an operator decide whether to roll out a change.
+FirstProof is a release verification workbench for Flagsmith. Flagsmith assigns each test episode to a policy, measures the outcomes, and applies the approved rollout. FirstProof runs the HTTP workload and checks whether the change meets the release criteria.
 
 The included experiment looks at a problem that can affect integrations serving multiple customers. When one workspace hits an API rate limit, a shared client queue can hold up requests from another workspace. FirstProof compares that shared cooldown with a cooldown scoped to the affected workspace and API method.
 
@@ -40,32 +40,46 @@ See [the experiment protocol](docs/EXPERIMENT_PROTOCOL.md) for the workload mix,
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Operator[Operator] -->|Prepare and approve| Web[FastAPI workbench]
-    Web -->|Protocols and jobs| DB[(FirstProof database)]
-    DB -->|Claim jobs| Worker[Worker]
-    Worker -->|Store observations and decisions| DB
-    DB -->|Results and reports| Web
+flowchart TB
+    subgraph Flagsmith["Flagsmith"]
+        direction LR
+        Setup["Experiment setup<br/>Metrics and allocation"]
+        Flag["Multivariate flag<br/>50/50 assignment and policy value"]
+        Events["Experimentation events<br/>Exposure, completion and latency"]
+        Warehouse[("Event warehouse")]
+        Results["Native experiment results<br/>Lift, credible interval and win probability"]
+        Rollout["Complete experiment<br/>Apply approved policy"]
+        Setup --> Flag
+        Events --> Warehouse --> Results
+        Rollout -->|Updates flag| Flag
+    end
 
-    Worker -->|Create, start and complete experiments| Flagsmith[Flagsmith API]
-    Worker -->|Evaluate flags and send events| SDK[Flagsmith Python SDK]
-    SDK --> Flagsmith
-    Flagsmith --> Warehouse[(Experiment event warehouse)]
-    Worker -->|Read native results and exposures| Flagsmith
+    subgraph FirstProof["FirstProof"]
+        direction LR
+        Web["Workbench<br/>Protocol and operator approval"]
+        DB[("Job queue and evidence")]
+        Worker["Experiment worker<br/>HTTP execution and release checks"]
+        FaultLab["FaultLab<br/>Controlled HTTP responses and traces"]
+        Web <-->|Jobs and reports| DB
+        DB <-->|Claim jobs and save evidence| Worker
+        Worker <-->|HTTP requests and server traces| FaultLab
+    end
 
-    Worker -->|Run two-workspace episodes| Runner[Cooldown runner]
-    Runner -->|Controlled HTTP requests| FaultLab[FaultLab]
-    FaultLab -->|Responses and server traces| Runner
-    Runner -->|Verified observations| Worker
-
-    Worker -. Optional research .-> SerpAPI[SerpAPI]
-    Worker -. Retrieve source issues .-> GitHub[GitHub API]
-    Worker -. Scenario proposal .-> OpenRouter[OpenRouter]
+    Worker -->|Management API creates and starts run| Setup
+    Flag -->|Python SDK returns policy per episode| Worker
+    Worker -->|Python SDK sends observed events| Events
+    Results -->|Read and reconcile counts| Worker
+    Worker -->|Management API sends approved decision| Rollout
 ```
 
-An operator prepares and approves a protocol in the workbench. In live mode, the worker creates and starts a Flagsmith experiment, evaluates the flag for each episode, and records exposure and outcome events. It stores the HTTP observations and reconciles aggregate counts with Flagsmith before presenting a release decision.
+| Live experiment stage | What Flagsmith does |
+| --- | --- |
+| Set up the experiment | The Management API creates the experiment and metrics, sets the allocation, and starts the run. |
+| Choose the policy | The Python SDK returns the assigned variant and its remote config value for each episode. The worker uses that value to decide which cooldown policy runs. |
+| Collect and analyze results | Experimentation records exposures, verified completion events, and latency in the connected warehouse. Flagsmith computes lift, credible intervals, and win probability. FirstProof compares aggregate counts with the HTTP evidence and checks the guardrails. |
+| Apply the decision | After operator approval, the Management API completes the experiment and applies the selected policy in the sandbox. FirstProof reads the resulting flag through the SDK and runs a fresh overlapping episode. |
 
-The workbench shows results by policy and scenario, example request traces, release checks, and an audit trail. An operator can export the observations as JSON or publish a read-only report.
+The workbench shows the local evidence behind each result, including the breakdown by scenario, request traces, and release checks. Operators can export the observations as JSON or publish a read-only report. Live runs require Flagsmith for assignment, experiment results, and completion. The local replay has its own assignment path so it can run without credentials.
 
 FirstProof also includes the original search-client retry experiment and an optional research workflow using SerpAPI and OpenRouter. Those services are not required for the workspace cooldown study.
 
