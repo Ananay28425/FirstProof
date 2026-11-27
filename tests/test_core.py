@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 from sqlalchemy import select
-from firstproof.contracts import default_protocol, Protocol, digest, Family
+from firstproof.contracts import cooldown_protocol, default_protocol, Protocol, digest, Family
+from firstproof.cooldown import episode_profile, run_episode
 from firstproof.db import Database, Experiment, Job
 from firstproof.faultlab import create_app
 from firstproof.integrations import github_issue_endpoint, reconcile_native
@@ -99,6 +100,52 @@ def test_native_reconciliation_and_gate():
 def test_corrupt_guard_blocks_candidate():
     p,s=fake_summary();s['groups'][CANDIDATE]['violations']['invalid_accepted']=1
     assert not release_decision(s,p,{'reconciled':True,'win_probability':.99,'srm_warning':False,'credible_interval':[.1,.3]},True)['eligible']
+
+
+@pytest.mark.asyncio
+async def test_workspace_cooldown_isolates_only_overlapping_reads():
+    import random
+
+    protocol = cooldown_protocol(seed=1729, workloads=100, purpose='main')
+    candidate = 'workspace_method_cooldown'
+    headers = {'X-Faultlab-Token': 'test-token'}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app('test-token'))) as client:
+        async def measure(family, variant):
+            profile = episode_profile(family.value, family, random.Random(1), protocol.deadline_ms)
+            return await run_episode(client, 'http://faultlab', headers, f'{family}:{variant}',
+                                     profile, variant, protocol)
+
+        shared, scoped, healthy_shared, healthy_scoped = await asyncio.gather(
+            measure(Family.COOLDOWN_OVERLAP, CONTROL),
+            measure(Family.COOLDOWN_OVERLAP, candidate),
+            measure(Family.HEALTHY_FIRST, CONTROL),
+            measure(Family.HEALTHY_FIRST, candidate),
+        )
+
+    assert shared['reason'] == 'verified_late'
+    assert all(row['success'] for row in (scoped, healthy_shared, healthy_scoped))
+    for row in (shared, scoped, healthy_shared, healthy_scoped):
+        assert row['trace_complete'] and row['a_recovered'] and not row['hint_violation']
+        assert row['attempt_count'] == 3
+        assert [item['status'] for item in row['server_trace']['A']] == [429, 200]
+        assert [item['status'] for item in row['server_trace']['B']] == [200]
+
+
+def test_workspace_recovery_regression_blocks_promotion():
+    protocol = cooldown_protocol(seed=1729, workloads=2000, purpose='main')
+    _, legacy = fake_summary()
+    control = legacy['groups']['control']
+    candidate = legacy['groups'].pop('context_aware')
+    legacy['groups']['workspace_method_cooldown'] = candidate
+    control['a_recovery_rate'] = candidate['a_recovery_rate'] = 1.0
+    native = {'reconciled': True, 'win_probability': .99, 'srm_warning': False,
+              'credible_interval': [.1, .3]}
+    assert release_decision(legacy, protocol, native, True)['eligible']
+    missing_srm = {**native, 'srm_warning': True, 'srm_p_value': None}
+    assert 'active 50/50 rollout' in release_decision(legacy, protocol, missing_srm, True)['reasons'][0]
+    candidate['a_recovery_rate'] = .999
+    decision = release_decision(legacy, protocol, native, True)
+    assert decision['reasons'] == ['Workspace A recovery regressed or is unavailable']
 
 
 @pytest.fixture

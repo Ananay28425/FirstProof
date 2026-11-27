@@ -2,9 +2,9 @@
 
 **Evidence-driven release verification for Flagsmith.**
 
-FirstProof discovers documented failure modes through SerpAPI, proposes restricted benchmark scenarios through OpenRouter, and uses native Flagsmith Experimentation to assign real HTTP retry implementations. Its deterministic verifier checks correctness, deadlines, resource usage and native count reconciliation before a human can authorize sandbox promotion. It does not replace Flagsmith's experimentation engine.
+**Can one rate limit stall two customers?** FirstProof compares a shared client cooldown with a workspace-and-method cooldown. A controlled upstream rate-limits Workspace A. Flagsmith assigns each two-workspace episode to one policy, and FirstProof measures whether the healthy workspace finishes within 500 ms while the throttled workspace still recovers. Inspect the real HTTP traces and use native results with an independently checked release gate to decide whether to promote.
 
-**Release status:** 0.1.0 development build. The local replay is executable and has passed the included tests. Live Flagsmith, SerpAPI, OpenRouter, PostgreSQL, Docker and hosted deployment still require validation in an environment with network access and credentials. No official experimental results are included. Never represent local replay as native experimentation.
+Local replays use the same HTTP runner and a labeled local allocator. The nominal workload mix describes a controlled study of the modeled shared-client behavior. It does not estimate the prevalence of affected Slack integrations.
 
 ## Quick start (Windows / macOS / Linux)
 
@@ -19,7 +19,7 @@ python -m pip install -e ".[dev]"
 python scripts/local.py
 ```
 
-Open **http://127.0.0.1:8000** and sign in with the token printed in your terminal. Select synthetic calibration, leave 30 workloads and approve the protocol. Watch real measured outcomes. Export raw JSON or publish the read-only report. Ctrl+C stops all three processes. The local database `local-replay.db` persists; delete it only if you intend to discard previous replays.
+Open **http://127.0.0.1:8000** and sign in with the token printed in your terminal. Select **Workspace cooldown · pinned Slack sources**, leave 30 workloads and approve the protocol. Watch real measured outcomes. Export raw JSON or publish the read-only report. Ctrl+C stops all three processes. The local database `local-replay.db` persists; delete it only if you intend to discard previous replays.
 
 The local profile uses a clearly labeled test double for allocation; it cannot authorize a native promotion. If the SDK is not available on your current package index, the local-only install is:
 
@@ -32,14 +32,14 @@ This is an offline-development fallback (packages still need to be available loc
 
 ## Real Flagsmith experiment (required for Track 01)
 
-Follow [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) in order. You need a Flagsmith environment with Experimentation enabled and a connected warehouse, a keyed multivariate feature, appropriate management credentials, and separately scoped SerpAPI and OpenRouter keys. The repository never contains real keys.
+Follow [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) in order. You need a Flagsmith environment with Experimentation enabled and a connected warehouse, a keyed multivariate feature, appropriate management credentials, and a dedicated PostgreSQL database. The workspace study uses pinned sources and requires no Slack, SerpAPI, or OpenRouter credentials. The repository never contains real keys.
 
 1. Run a disposable native pilot in a dedicated Flagsmith environment; complete it with control retained.
 2. Set up a **different** native environment for the frozen main study. Inspect the credible baseline, pilot metrics, sample-size assumption, scenario weights and guardrails. Do not tune on the main or reserved validation results.
 3. Set `.env` from `.env.example`, fill in the required IDs/keys and `MODE=live`, then run the database migration and web/worker/FaultLab services.
-4. Prepare a source-backed main protocol, inspect the evidence and approve it. FirstProof provisions the native metric and experiment, activates it, runs the workloads, records SDK exposures and verified conversions, and stores raw observations.
+4. Select the pinned workspace protocol and prepare a main draft, inspect the evidence and approve it. FirstProof provisions the native occurrence and latency metrics and experiment, activates it, runs the episodes, records SDK exposures, verified conversions and B’s elapsed time, and stores raw observations.
 5. Request native result and exposure refresh after events arrive; respect the server's refresh cooldown. Read results again once available. FirstProof compares aggregate native counts with actual local observations; it does not claim per-identity warehouse verification.
-6. Approve native completion (retain control or, only when all gates pass, promote candidate). FirstProof reads back Flagsmith state and executes a controlled smoke request without deploying new code. The release is confined to the dedicated sandbox.
+6. Approve native completion (retain control or, only when all gates pass, promote candidate). FirstProof reads back Flagsmith state and replays a fresh overlapping episode without deploying new code. The release is confined to the dedicated sandbox.
 
 ## PostgreSQL / Docker Compose
 
@@ -66,6 +66,7 @@ The migration service seeds schema and admission counters before web/worker star
 | `contracts.py` | Typed immutable protocol, evidence and schema constraints |
 | `db.py` | Relational records, transactions, leased queue and budget |
 | `faultlab.py` | Private time-based controlled upstream and independent server trace |
+| `cooldown.py` | Two-workspace episode execution, policy-scoped state and trace comparison |
 | `policies.py` | Two actual read-only HTTP policies sharing correct retry semantics |
 | `verification.py` | Deterministic contract checks, raw metrics and conservative release policy |
 | `integrations.py` | Native Flagsmith SDK/admin API, real SerpAPI and OpenRouter |
@@ -83,7 +84,8 @@ Removing Flagsmith in live mode disables enrollment, verified native conversions
 ```bash
 python -m pytest -q
 python -m compileall -q firstproof
-python scripts/sample_size.py --baseline 0.65 --delta 0.05
+# Use pilot estimates and a predeclared practical effect for sample sizing.
+python scripts/sample_size.py --baseline 0.55 --delta 0.10
 # After starting the owned service; k6 installed separately:
 k6 run benchmarks/read-spike.js
 ```
@@ -97,4 +99,3 @@ Official target: Track 01. Track 02 functionality supports it through evidence r
 ## License and methodology
 
 MIT license. Weaponized Curiosity informs the research and falsification methodology, not an unbounded runtime agent. See [AGENTS.md](AGENTS.md) and the upstream [skill](https://github.com/ayushrajsinghparihar/weaponized-curiosity).
-# FirstProof

@@ -2,7 +2,7 @@
 import math
 from collections import Counter
 from .policies import Outcome, CONTROL, CANDIDATE
-from .contracts import Protocol
+from .contracts import COOLDOWN_VARIANTS, Protocol
 
 
 def verify(outcome: Outcome, server: list[dict], expected: str, protocol: Protocol) -> dict:
@@ -46,7 +46,8 @@ def percentile(values, p):
 def summarize(rows: list[dict], protocol: Protocol) -> dict:
     """Aggregate only recorded observations, counting failures in the denominator."""
     result = {'groups': {}, 'planned': protocol.workloads, 'observed': len(rows), 'by_scenario': {}}
-    for variant in (CONTROL, CANDIDATE):
+    variants = tuple(COOLDOWN_VARIANTS) if protocol.cooldown else (CONTROL, CANDIDATE)
+    for variant in variants:
         group = [r for r in rows if r['assignment'] == variant]
         n = len(group)
         successes = sum(r['success'] for r in group)
@@ -57,10 +58,15 @@ def summarize(rows: list[dict], protocol: Protocol) -> dict:
             'p99_ms': percentile([r['elapsed_ms'] for r in group], .99),
             'violations': {k: sum(bool(r[k]) for r in group) for k in ('invalid_accepted','attempt_violation','hint_violation','deadline_violation')},
             'incomplete_traces': sum(not r['trace_complete'] for r in group)}
+        if protocol.cooldown:
+            result['groups'][variant]['a_recoveries'] = sum(r['a_recovered'] for r in group)
+            result['groups'][variant]['a_recovery_rate'] = (
+                result['groups'][variant]['a_recoveries'] / n if n else None
+            )
         for family in {r['family'] for r in group}:
             subset = [r for r in group if r['family'] == family]
             result['by_scenario'].setdefault(family, {})[variant] = {'n': len(subset), 'successes': sum(r['success'] for r in subset)}
-    a,b = (result['groups'][k] for k in (CONTROL,CANDIDATE))
+    a,b = (result['groups'][k] for k in variants)
     result['lift_pp'] = 100*(b['rate']-a['rate']) if a['n'] and b['n'] else None
     result['amplification_pct'] = 100*(b['mean_attempts']/a['mean_attempts']-1) if a['mean_attempts'] and b['mean_attempts'] is not None else None
     result['complete'] = len(rows) == protocol.workloads and all(r['trace_complete'] for r in rows) and a['n']+b['n']==len(rows)
@@ -85,14 +91,30 @@ def release_decision(summary: dict, protocol: Protocol, native: dict, validation
     require evidence of practical benefit. The native win probability remains native.
     """
     reasons = []
-    a,b = (summary['groups'][k] for k in (CONTROL,CANDIDATE))
+    variants = tuple(COOLDOWN_VARIANTS) if protocol.cooldown else (CONTROL, CANDIDATE)
+    a,b = (summary['groups'][k] for k in variants)
     lower = 100*(wilson(b['successes'],b['n'],2.2414)[0]-wilson(a['successes'],a['n'],2.2414)[1])
     if not summary['complete'] or summary['srm_warning']: reasons.append('Incomplete or imbalanced local observations')
     if any(b['violations'].values()): reasons.append('Candidate safety guardrail failed')
+    if protocol.cooldown and not workspace_recovery_preserved(a, b):
+        reasons.append('Workspace A recovery regressed or is unavailable')
     if summary['amplification_pct'] is None or summary['amplification_pct'] > protocol.max_amplification_pct: reasons.append('Request amplification exceeds threshold or is unavailable')
     if min(a['n'],b['n']) < 50 or min(a['successes'],b['successes']) < 5: reasons.append('Insufficient native reporting minimum')
     if lower < protocol.min_effect_pp: reasons.append('Practical improvement not established by conservative lower bound')
-    if not native.get('reconciled') or native.get('win_probability',0) < .95 or native.get('srm_warning',True) or not native.get('credible_interval') or native['credible_interval'][0] <= 0: reasons.append('Native statistical evidence missing, inconsistent or inconclusive')
+    if native.get('reconciled') and native.get('srm_warning') is not False:
+        if protocol.cooldown and native.get('srm_p_value') is None and native.get('independent_srm_p_value') is None:
+            reasons.append('Sample ratio check unavailable. Verify the active 50/50 rollout and reconcile at least 100 exposures.')
+        else:
+            reasons.append('Native sample ratio check failed or is unavailable')
+    if not native.get('reconciled') or native.get('win_probability',0) < .95 or not native.get('credible_interval') or native['credible_interval'][0] <= 0:
+        reasons.append('Native statistical evidence missing, inconsistent or inconclusive')
     if protocol.purpose != 'main': reasons.append('Only a main protocol can authorize promotion')
     if not validation_passed: reasons.append('Independent reserved validation not approved')
     return {'eligible': not reasons, 'decision': 'eligible_for_human_approval' if not reasons else 'retain_incumbent', 'reasons': reasons, 'effect_lower_bound_pp': lower}
+
+
+def workspace_recovery_preserved(control: dict, candidate: dict) -> bool:
+    """Require no observed decrease in A's recovery rate."""
+    baseline = control.get('a_recovery_rate')
+    proposed = candidate.get('a_recovery_rate')
+    return baseline is not None and proposed is not None and proposed >= baseline

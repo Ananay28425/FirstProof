@@ -60,6 +60,8 @@ def main():
                 eid=page.url.rsplit('/',1)[1]
                 export=page.request.get(base+'/experiments/'+eid+'/export');assert export.ok
                 report=export.json();assert report['summary']['observed']==30 and report['summary']['complete'] and not report['summary']['decision']['eligible']
+                assert report['protocol']['policy_version']=='cooldown-v1'
+                assert page.get_by_role('heading',name='Example episode traces').is_visible()
                 (out/'local-replay-evidence.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
                 page.screenshot(path=str(out/'local-workbench.png'),full_page=True)
                 page.get_by_role('button',name='Publish read-only report').click();page.get_by_role('button',name='Sign out').click()
@@ -67,7 +69,7 @@ def main():
                 page.set_viewport_size({'width':390,'height':844});page.screenshot(path=str(out/'local-mobile.png'),full_page=True)
                 assert not errors,errors
                 browser.close()
-            print('PASS: Chromium operator workflow, 30 actual HTTP replay workloads, export, publication and mobile rendering.')
+            print('PASS: Chromium operator workflow, 30 two-workspace HTTP episodes, export, publication and mobile rendering.')
         finally:
             for process in processes:
                 if process.poll() is None:process.terminate()

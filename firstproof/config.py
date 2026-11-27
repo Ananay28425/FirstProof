@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     flagsmith_project_id: int = 0
     flagsmith_feature_id: int = 0
     flagsmith_candidate_id: int = 0
-    flagsmith_flag: str = 'firstproof_retry_policy'
+    flagsmith_flag: str = 'firstproof_workspace_cooldown'
     flagsmith_release_flag: str = 'firstproof_retry_policy'
     # Explicit native feature state ID for a dedicated sandbox release environment.
     flagsmith_release_state_id: int = 0

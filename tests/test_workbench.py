@@ -29,8 +29,8 @@ def login(cfg,client):
     return session_csrf(client.cookies['firstproof_session'],cfg.operator_token.get_secret_value())
 
 
-def create_draft(cfg,client,csrf):
-    r=client.post('/experiments',data={'csrf_token':csrf,'name':'Actual retry experiment','purpose':'pilot','source':'synthetic','workloads':'14','seed':'1729'},headers={'origin':cfg.public_origin},follow_redirects=False)
+def create_draft(cfg,client,csrf,source='synthetic',workloads=14):
+    r=client.post('/experiments',data={'csrf_token':csrf,'name':'Actual HTTP experiment','purpose':'pilot','source':source,'workloads':str(workloads),'seed':'1729'},headers={'origin':cfg.public_origin},follow_redirects=False)
     assert r.status_code==303,r.text
     return r.headers['location'].rsplit('/',1)[1]
 
@@ -50,7 +50,8 @@ def test_auth_csrf_and_private_reports(setup):
     assert client.get('/experiments/'+eid+'/export').status_code==401
 
 
-def test_e2e_actual_http_replay(setup):
+@pytest.mark.parametrize('source', ['synthetic', 'pinned'])
+def test_e2e_actual_http_replay(setup, source):
     cfg,db,client=setup
     # Use a real bound loopback socket, not a mocked policy outcome.
     sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.listen(128)
@@ -62,7 +63,7 @@ def test_e2e_actual_http_replay(setup):
             time.sleep(.03)
         assert server.started
         cfg.faultlab_url=f'http://127.0.0.1:{port}'
-        csrf=login(cfg,client);eid=create_draft(cfg,client,csrf)
+        csrf=login(cfg,client);eid=create_draft(cfg,client,csrf,source)
         with db.tx() as s:ph=s.get(Experiment,eid).protocol_hash
         response=client.post('/experiments/'+eid+'/action',data={'csrf_token':csrf,'action':'run','approval_hash':ph},headers={'origin':cfg.public_origin},follow_redirects=False)
         assert response.status_code==303,response.text
@@ -79,7 +80,14 @@ def test_e2e_actual_http_replay(setup):
             assert len(list(s.scalars(select(Workload).where(Workload.experiment_id==eid))))==14
         page=client.get('/experiments/'+eid);assert page.status_code==200
         assert 'Measured outcomes' in page.text and 'Retain incumbent' in page.text
-        assert client.get('/experiments/'+eid+'/export').json()['summary']['observed']==14
+        report = client.get('/experiments/'+eid+'/export').json()
+        assert report['summary']['observed'] == 14
+        if source == 'pinned':
+            assert report['protocol']['policy_version'] == 'cooldown-v1'
+            assert len(report['protocol']['evidence']) == 2
+            assert 'Example episode traces' in page.text and 'Workspace A recovered' in page.text
+            assert all(row['observation']['a_recovered'] for row in report['workloads'])
+            assert not any(row['observation']['hint_violation'] for row in report['workloads'])
         assert client.post('/experiments/'+eid+'/action',data={'csrf_token':csrf,'action':'publish'},headers={'origin':cfg.public_origin},follow_redirects=False).status_code==303
         client.cookies.clear();assert client.get('/experiments/'+eid).status_code==200
         assert client.get('/experiments/'+eid+'/export').status_code==401

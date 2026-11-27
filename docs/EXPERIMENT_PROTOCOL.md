@@ -1,4 +1,17 @@
-# Experiment protocol
+# Workspace cooldown experiment protocol
+
+One Flagsmith identity is one isolated two-workspace episode. Both workspaces call one read method. Control models a shared client queue cooldown. Candidate scopes cooldown to the workspace and method. FaultLab applies the same upstream rules regardless of assignment.
+
+The primary occurrence event is verified completion by healthy Workspace B within 500 ms of enqueue. The numeric secondary metric measures elapsed time from enqueue to response, including late reads. Both variants have the same three-second execution bound per workspace. A throttled Workspace A gets at most one retry and must honor Retry-After, verify the response, and recover within three seconds. The study measures total upstream attempts for both workspaces.
+
+The workload mix is 20% healthy, 40% early overlap, 15% near the deadline boundary, 15% healthy workspace first, and 10% after cooldown. These are generator weights. Actual counts vary with the frozen seed. Delays and one- or two-second hints come from seeded bounded distributions. For overlapping scenarios, B’s arrival is relative to receipt of A’s first response. This intentionally tests how much overlap matters under the chosen workload and budget. The fixture does not run the Slack SDK or estimate impact in production.
+
+The operator approves the exact protocol, source fixture, seed and sample size. Use a disposable pilot to verify both native exposure counts and outcome ingestion. Freeze a separate main environment and study before checking results. The UI defaults to 400 episodes in live mode, subject to sizing from pilot rates and the precision required by the release rule. The reporting minimum does not power a practical effect test.
+
+Promotion requires native count reconciliation, a positive credible interval and at least 95% chance to beat control. The local gate requires a conservative lower bound of +5 percentage points, zero candidate safety violations, no observed decrease in A recovery, at most 10% more upstream attempts, and a passing reserved paired replay. The elapsed-time metric is descriptive. Complete the native study with the candidate only after operator approval. Otherwise retain control. A new overlapping episode verifies the applied flag and expected behavior.
+
+## Original search-client study
+
 
 Decision: whether remaining-budget-aware backoff deserves promotion via Flagsmith. Control: capped exponential full jitter, bounded attempts and deadline, honors Retry-After. Candidate: same policy but constrains jitter to leave 120 ms of remaining time for another attempt. A mandatory server delay overrides jitter clipping. Both use a 600 ms per-attempt timeout in the benchmark. Normal search uses a larger timeout and is not a direct extrapolation.
 

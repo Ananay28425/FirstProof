@@ -14,11 +14,12 @@ from datetime import datetime, timezone
 import httpx
 from sqlalchemy import select, update
 from .config import settings
-from .contracts import Protocol, Family, digest
+from .contracts import COOLDOWN_VARIANTS, Protocol, Family, digest
+from .cooldown import episode_profile, run_episode
 from .db import Database, Experiment, Workload, Job, Outbox
 from .integrations import FlagsmithAdmin, NativeRuntime, LocalReplay, IntegrationError, research, propose, reconcile_native, request_json
 from .policies import execute, CONTROL, CANDIDATE
-from .verification import verify, summarize, release_decision
+from .verification import verify, summarize, release_decision, workspace_recovery_preserved
 
 log = logging.getLogger('firstproof.worker')
 
@@ -34,8 +35,11 @@ def manifest(protocol: Protocol, eid: str, *, holdout=False):
         # First few holdout cases deterministically cover the declared guard families.
         if holdout and i < len(families): f = families[i]
         key = f'{eid}:{"h" if holdout else "m"}:{i}'
-        profile = {'family':f.value,'outage_ms':rng.randint(60,900),'delay_ms':rng.randint(5,35),
-                   'retry_after':1,'expected':hashlib.sha256((key+':fixture').encode()).hexdigest()[:24]}
+        if protocol.cooldown:
+            profile = episode_profile(key, f, rng, protocol.deadline_ms)
+        else:
+            profile = {'family':f.value,'outage_ms':rng.randint(60,900),'delay_ms':rng.randint(5,35),
+                       'retry_after':1,'expected':hashlib.sha256((key+':fixture').encode()).hexdigest()[:24]}
         yield key, i, profile, rng.randrange(2**63)
 
 
@@ -92,6 +96,8 @@ class Worker:
         """Execute the identical client against a private HTTP transport; observe server trace."""
         root = self.cfg.faultlab_url.rstrip('/')
         hdr = {'X-Faultlab-Token':self.cfg.faultlab_token.get_secret_value()}
+        if p.cooldown:
+            return await run_episode(http, root, hdr, identity, profile, policy, p)
         await request_json(http,'PUT',f'{root}/profiles/{identity}',headers=hdr,payload=profile)
         try:
             outcome = await execute(http,f'{root}/search/{identity}',policy,p.deadline_ms,p.max_attempts,seed,headers=hdr)
@@ -109,7 +115,14 @@ class Worker:
         live = e.mode == 'live'
         runtime = NativeRuntime(self.cfg) if live else LocalReplay()
         remote = dict(e.remote)
-        event = 'operation_verified_'+e.id.replace('-','')
+        suffix = e.id.replace('-', '')
+        event = ('workspace_b_on_time_' if p.cooldown else 'operation_verified_') + suffix
+        latency_event = 'workspace_b_elapsed_ms_' + suffix
+        variants = tuple(COOLDOWN_VARIANTS) if p.cooldown else (CONTROL, CANDIDATE)
+        rows = list(manifest(p, e.id))
+        holdout = list(manifest(p, e.id, holdout=True)) if p.purpose == 'main' and live else []
+        remote['manifest_hash'] = digest({'rows': rows, 'holdout': holdout})
+        remote['flag_name'] = self.cfg.flagsmith_flag
         try:
             async with httpx.AsyncClient(timeout=12,trust_env=False,limits=httpx.Limits(max_connections=self.cfg.workload_concurrency+4,max_keepalive_connections=self.cfg.workload_concurrency+2)) as http:
                 if live:
@@ -121,18 +134,29 @@ class Worker:
                     remote,metric = await self.remote_journal(e.id,remote,'create_metric',lambda:admin.create_metric(event))
                     remote.update(metric_id=int(metric['id']),event=event)
                     self.mutate(e.id,'metric_created',remote=remote)
-                    remote,native = await self.remote_journal(e.id,remote,'create_experiment',lambda:admin.create_experiment('FirstProof '+e.id,p.hypothesis,remote['metric_id']))
+                    if p.cooldown:
+                        remote, metric = await self.remote_journal(
+                            e.id, remote, 'create_latency_metric',
+                            lambda: admin.create_metric(latency_event, numeric=True),
+                        )
+                        remote.update(latency_metric_id=int(metric['id']), latency_event=latency_event)
+                        self.mutate(e.id, 'latency_metric_created', remote=remote)
+                    remote,native = await self.remote_journal(
+                        e.id, remote, 'create_experiment',
+                        lambda: admin.create_experiment(
+                            ('Workspace cooldown ' if p.cooldown else 'FirstProof ') + e.id,
+                            p.hypothesis, remote['metric_id'], cooldown=p.cooldown,
+                            latency_metric_id=remote.get('latency_metric_id'),
+                        ),
+                    )
                     remote.update(experiment_id=int(native['id']),dashboard=admin.dashboard(native['id']))
                     self.mutate(e.id,'native_created',remote=remote)
                     remote,current = await self.remote_journal(e.id,remote,'start_experiment',lambda:admin.start(remote['experiment_id']))
                     remote['rollout_snapshot'] = current.get('experiment_rollout')
                     if not remote['rollout_snapshot']: raise IntegrationError('Native rollout readback unavailable')
                     self.mutate(e.id,'native_started',remote=remote)
-                rows = list(manifest(p,e.id))
                 # Entire manifest and seeds are recorded before assignment; holdout remains
                 # separate and never emits native events or contributes to the main metric.
-                holdout = list(manifest(p,e.id,holdout=True)) if p.purpose=='main' and live else []
-                remote['manifest_hash'] = digest({'rows':rows,'holdout':holdout})
                 self.mutate(e.id,'manifest_frozen',remote=remote,status='running')
                 with self.db.tx() as s:
                     self.db.fence(s,self.job,self.owner)
@@ -141,7 +165,7 @@ class Worker:
                 async def one(item):
                     identity, ordinal, profile, seed = item
                     async with semaphore:
-                        variant = await runtime.evaluate(identity,remote.get('experiment_id'))
+                        variant = await runtime.evaluate(identity,remote.get('experiment_id'),cooldown=p.cooldown)
                         # Persist assignment before exposure; if worker dies, the run is invalid.
                         with self.db.tx() as s:
                             self.db.fence(s,self.job,self.owner)
@@ -152,6 +176,8 @@ class Worker:
                             self.db.fence(s,self.job,self.owner)
                             w = s.get(Workload,identity); w.observation=obs; w.phase='observed'
                             if live and obs['success']: s.add(Outbox(id=identity,experiment_id=e.id))
+                        if live and p.cooldown and obs['trace_complete']:
+                            await runtime.numeric_event(identity, latency_event, obs['elapsed_ms'])
                         return {'assignment':variant,'family':profile['family'],**obs}
                 # Schedule bounded chunks rather than thousands of simultaneous tasks.
                 observations=[]
@@ -167,23 +193,40 @@ class Worker:
                             with self.db.tx() as s:
                                 self.db.fence(s,self.job,self.owner)
                                 o=s.get(Outbox,identity);o.state='sdk_submitted';o.attempts+=1
+                        await runtime.flush()
                 await runtime.flush()
                 summary=summarize(observations,p)
+                if p.cooldown:
+                    samples = {}
+                    for obs in observations:
+                        samples.setdefault(obs['family'], {}).setdefault(obs['assignment'], obs)
+                    summary['example_episodes'] = samples
                 # Persist main observations before reserved validation. This validation
                 # uses both implementations on matched held-out profiles, not Flagsmith
                 # exposure data; it checks guardrails and non-regression, not significance.
                 validation={'passed':False,'status':'not_run'}
                 if holdout:
-                    checks=[]
-                    for identity,ordinal,profile,seed in holdout:
+                    async def check_pair(item):
+                        identity, ordinal, profile, seed = item
                         # Alternate paired order to reduce systematic warm-up/order bias.
-                        order=(CONTROL,CANDIDATE) if ordinal%2==0 else (CANDIDATE,CONTROL)
+                        order=variants if ordinal%2==0 else variants[::-1]
+                        pair = []
                         for variant in order:
                             row=await self.fault_operation(http,identity+':'+variant,profile,seed,variant,p)
-                            checks.append({'assignment':variant,'family':profile['family'],**row})
+                            pair.append({'assignment':variant,'family':profile['family'],**row})
+                        return pair
+
+                    checks = []
+                    for i in range(0, len(holdout), self.cfg.workload_concurrency):
+                        async with asyncio.TaskGroup() as tg:
+                            pairs = [tg.create_task(check_pair(row))
+                                     for row in holdout[i:i+self.cfg.workload_concurrency]]
+                        checks.extend(obs for pair in pairs for obs in pair.result())
                     vp=p.model_copy(update={'workloads':len(checks)})
-                    vs=summarize(checks,vp); b=vs['groups'][CANDIDATE]
+                    vs=summarize(checks,vp); a,b=(vs['groups'][k] for k in variants)
                     passed=vs['complete'] and not any(b['violations'].values()) and vs['lift_pp']>=0 and vs['amplification_pct']<=p.max_amplification_pct
+                    if p.cooldown:
+                        passed = passed and workspace_recovery_preserved(a, b)
                     validation={'passed':bool(passed),'status':'reserved_paired_check','summary':vs,'observations':checks}
                 summary['validation']=validation
                 summary['native']={'reconciled':False,'status':'awaiting_flagsmith' if live else 'local_replay_not_native'}
@@ -211,18 +254,28 @@ class Worker:
                 await admin.call('POST',f'experiments/{rid}/exposures/refresh/')
             raw=await admin.results(rid); exp=await admin.call('GET',f'experiments/{rid}/exposures/')
         summary=dict(e.summary)
-        native=reconcile_native(raw,summary,remote['metric_id'],exp)
+        rollout = current['experiment_rollout']
+        verified_equal_split = (
+            rollout.get('enabled') is True and rollout.get('rollout_percentage') == 100
+            and rollout.get('multivariate_feature_state_values') == [{
+                'multivariate_feature_option': self.cfg.flagsmith_candidate_id,
+                'percentage_allocation': 50,
+            }]
+        )
+        native=reconcile_native(raw,summary,remote['metric_id'],exp,cooldown=p.cooldown,
+                                verified_equal_split=verified_equal_split)
         summary['native']=native
         summary['native_raw']=raw
         summary['native_exposures_raw']=exp
         summary['decision']=release_decision(summary,p,native,summary['validation']['passed'])
-        self.mutate(e.id,'native_results_read',summary=summary,status='analyzed' if native['reconciled'] else 'awaiting_native')
+        self.mutate(e.id,'native_results_read',summary=summary,error='',
+                    status='analyzed' if native['reconciled'] else 'awaiting_native')
         if native['reconciled']:
             with self.db.tx() as s:
                 self.db.fence(s,self.job,self.owner)
                 s.execute(update(Outbox).where(Outbox.experiment_id==e.id,Outbox.state=='sdk_submitted').values(state='aggregate_reconciled'))
 
-    async def finish(self,e,variant):
+    async def finish(self,e,promote):
         """Complete a native experiment using official API; candidate is gate-bound.
 
         Promotion is confined to the dedicated experiment sandbox. A separate normal
@@ -230,7 +283,10 @@ class Worker:
         """
         p=Protocol.model_validate(e.protocol); remote=dict(e.remote)
         self.assert_binding(remote)
-        if variant==CANDIDATE and not release_decision(e.summary,p,e.summary['native'],e.summary['validation']['passed'])['eligible']:
+        values = COOLDOWN_VARIANTS if p.cooldown else {CONTROL: CONTROL, CANDIDATE: CANDIDATE}
+        candidate = next(key for key in values if key != CONTROL)
+        variant = candidate if promote else CONTROL
+        if promote and not release_decision(e.summary,p,e.summary['native'],e.summary['validation']['passed'])['eligible']:
             raise IntegrationError('Candidate not eligible for promotion')
         async with httpx.AsyncClient(timeout=15,trust_env=False) as http:
             admin=FlagsmithAdmin(self.cfg,http); rid=remote['experiment_id']; current=await admin.inspect(rid)
@@ -241,27 +297,38 @@ class Worker:
             raw=await admin.results(rid); exp=await admin.call('GET',f'experiments/{rid}/exposures/')
             if raw!=e.summary['native_raw'] or exp!=e.summary['native_exposures_raw']:
                 raise IntegrationError('Native evidence changed; reconcile and approve again')
-            body={'rollout_decision':'variant','rollout_variant':self.cfg.flagsmith_candidate_id} if variant==CANDIDATE else {'rollout_decision':'control'}
+            body={'rollout_decision':'variant','rollout_variant':self.cfg.flagsmith_candidate_id} if promote else {'rollout_decision':'control'}
             remote,result=await self.remote_journal(e.id,remote,'complete_experiment',lambda:admin.call('POST',f'experiments/{rid}/complete/',body))
             readback=await admin.inspect(rid)
             if readback.get('status')!='completed' or readback.get('rollout_decision')!=body['rollout_decision']:
                 raise IntegrationError('Native completion readback mismatch')
             remote['release_readback']=readback
+            self.mutate(e.id,'native_completion_confirmed',remote=remote)
             # Verify selected runtime value without using an exposure-producing call.
             runtime=NativeRuntime(self.cfg)
             try:
                 flags=await runtime._call(runtime.sdk.get_identity_flags,'fp-release-check-'+e.id)
                 f=flags.get_flag(self.cfg.flagsmith_flag)
-                if not f.enabled or f.value!=variant: raise IntegrationError('Selected behavior not confirmed by SDK')
+                if not f.enabled or f.value!=values[variant]: raise IntegrationError('Selected behavior not confirmed by SDK')
                 remote['runtime_readback']=f.value
                 # A controlled smoke request shows the selected runtime behavior, not a new A/B conversion.
                 _,_,profile,seed=next(manifest(p,e.id,holdout=True))
-                profile={**profile,'family':'healthy'}
-                smoke=await self.fault_operation(http,e.id+':release-smoke',profile,seed,f.value,p)
-                if not smoke['success']: raise IntegrationError('Native selection confirmed but release smoke test failed')
+                if p.cooldown:
+                    profile = episode_profile(e.id, Family.COOLDOWN_OVERLAP, random.Random(seed), p.deadline_ms)
+                    # Freeze a clear overlap for the release replay, outside the study.
+                    profile['arrival_offset_ms'] = 30
+                else:
+                    profile={**profile,'family':'healthy'}
+                smoke=await self.fault_operation(http,e.id+':release-smoke',profile,seed,variant,p)
+                valid = smoke['success']
+                if p.cooldown:
+                    valid = (smoke['reason'] == ('verified_on_time' if promote else 'verified_late')
+                             and smoke['a_recovered'] and smoke['trace_complete']
+                             and not any(smoke[k] for k in ('hint_violation', 'attempt_violation', 'invalid_accepted', 'deadline_violation')))
+                if not valid: raise IntegrationError('Native selection confirmed but release smoke test failed')
                 remote['release_smoke']=smoke
             finally: await runtime.close()
-        self.mutate(e.id,'release_completed',remote=remote,status='promoted' if variant==CANDIDATE else 'retained')
+        self.mutate(e.id,'release_completed',remote=remote,status='promoted' if promote else 'retained')
 
     async def process(self,job):
         jid,eid,kind=job; self.job=jid
@@ -275,12 +342,15 @@ class Worker:
             if kind=='research': await self.research_job(e)
             elif kind=='run': await self.run(e)
             elif kind in {'reconcile','refresh'}: await self.reconcile(e,kind=='refresh')
-            elif kind in {'retain','promote'}: await self.finish(e,CONTROL if kind=='retain' else CANDIDATE)
+            elif kind in {'retain','promote'}: await self.finish(e,kind=='promote')
             else: raise RuntimeError('Unknown job type')
             with self.db.tx() as s: self.db.fence(s,jid,self.owner).state='done'
         except Exception as exc:
             # Never include arbitrary provider exceptions (URLs may contain keys).
-            message=str(exc)[:250] if isinstance(exc,IntegrationError) else type(exc).__name__
+            cause = exc
+            while isinstance(cause, BaseExceptionGroup) and len(cause.exceptions) == 1:
+                cause = cause.exceptions[0]
+            message = str(cause)[:250] if isinstance(cause, IntegrationError) else type(cause).__name__
             log.warning('job_failed kind=%s id=%s type=%s',kind,jid,type(exc).__name__)
             try:
                 with self.db.tx() as s:

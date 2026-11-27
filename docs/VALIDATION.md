@@ -1,4 +1,16 @@
-# Validation report — development build 0.1.0
+# FirstProof validation
+
+## Workspace cooldown study
+
+- **31 tests passed** on Python 3.12.3. The suite covers real loopback replay of both studies, overlap and non-overlap behavior, native event contracts, missing or invalid sample ratio diagnostics, and the Workspace A recovery guard. Uvicorn's WebSocket dependency emitted two deprecation warnings.
+- **Chrome smoke passed** for operator sign-in, approval, 30 two-workspace HTTP episodes, trace display, raw export, read-only publication and mobile rendering. It used local assignment.
+- **PostgreSQL 17 passed** Alembic upgrade and schema check, plus the lease-recovery and duplicate-claim test against a disposable database.
+- **Native Flagsmith passed end to end** in a disposable self-hosted sandbox on November 27, 2026. Python SDK 6.7.0 assigned 160 HTTP episodes. The exposure and occurrence counts reconciled, and Flagsmith returned the numeric latency metric. Workspace B finished within 500 ms in 46 of 87 shared episodes and 73 of 73 scoped episodes, a gain of 47.1 percentage points. Workspace A completed every episode. The candidate's average upstream attempts increased by 4.0%, below the 10% guardrail.
+- **The release path passed.** Flagsmith reported a 99.9998% chance to beat control. The independent exposure ratio check returned p = 0.2684 because the native diagnostic was unavailable. The reserved validation passed across 20 matched pairs. A test approval through the operator workflow completed the candidate rollout. FirstProof read back the applied flag and verified B's fresh read in 33.9 ms. Workspace A also succeeded in that replay.
+
+The native sandbox used Flagsmith image digest `sha256:48905c664152d8ae2c843ec9cee72ff197e7caff6e91b959bb851a235915ea35`. The run verifies the integration and release flow on controlled workloads. The official study and submission are pending.
+
+## Original search-client study — development build 0.1.0
 
 This report distinguishes actual measurements from unexecuted checks. No credentials or native experiment observations are included.
 

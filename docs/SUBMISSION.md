@@ -1,16 +1,13 @@
-# Toggle Wars Track 01 submission checklist
+# Toggle Wars Track 01 submission
 
-Primary: native Flagsmith experiment, not generic AI agent. Do not claim simultaneous cash-prize eligibility from other tracks.
+**Question:** Can a rate limit on one workspace make an unrelated workspace miss its sync deadline?
 
-Before recording: verify rules and deadline on the event website; commit exact dependency lock and app revision; run actual native pilot; select an independent main environment; approve source-backed frozen protocol; run actual workload; reconcile native exposure/conversion counts; preserve raw observations; complete with approved control/candidate; show runtime readback; complete deployment, security checks, load tests and public report.
+Before recording, reconcile the dedicated native pilot. Freeze the main protocol in a separate environment. Keep the exact inputs, per-episode traces, Flagsmith results, release decision and fresh replay. Publish the reviewed report from the operator console and include the public repository and setup instructions.
 
-Three-minute demo outline (use actual measured results only):
+- **0:00–0:20** Show A receiving a rate limit and B’s queue wait. Open the pinned Slack API and SDK evidence.
+- **0:20–0:55** Show the two flag policies and a traced overlap episode. Then show a scenario where both finish on time.
+- **0:55–1:40** Open native Flagsmith results. Explain the B completion criterion, effect, interval and exposure counts.
+- **1:40–2:15** Check whether A recovered, Retry-After was respected and attempts stayed bounded.
+- **2:15–2:45** Approve the justified sandbox decision. Re-run a fresh incident under the read-back flag without deploying code.
 
-- 0:00–0:20 show the Flagsmith flag and the engineering question.
-- 0:20–0:50 show SerpAPI source and restricted scenario mapping, including contrary evidence.
-- 0:50–1:15 approve exact protocol; show native allocation and real HTTP execution.
-- 1:15–2:00 show native results, conversion counts and independently verified guardrails.
-- 2:00–2:35 explain the justified release/hold; authorize native completion; show readback and controlled smoke request.
-- 2:35–3:00 show raw export, reproducible setup and self-hosted configuration if tested.
-
-A statistically inconclusive or losing candidate is not a defect in a well-designed experiment. Report that outcome accurately. The judges must see native Flagsmith as the indispensable experiment and release authority. Do not show test double values as native outcomes or promise a winning submission.
+Use actual native results for the submission. If the experiment is inconclusive or violates a guardrail, show why FirstProof held the incumbent. Local calibration is labeled in the report.

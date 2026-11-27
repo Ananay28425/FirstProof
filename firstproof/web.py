@@ -19,7 +19,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy import select, func
 from .config import settings
-from .contracts import Protocol, default_protocol, digest
+from .contracts import Protocol, cooldown_protocol, default_protocol, digest
 from .db import Database, Experiment, Workload, Audit, Job, Budget
 from .verification import release_decision
 
@@ -75,7 +75,7 @@ def create_app(cfg=None, db=None):
         response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['X-Frame-Options']='DENY'
-        response.headers['Referrer-Policy']='no-referrer'
+        response.headers['Referrer-Policy']='same-origin'
         response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
         response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()'
         if cfg.secure_cookies: response.headers['Strict-Transport-Security']='max-age=31536000'
@@ -136,16 +136,16 @@ def create_app(cfg=None, db=None):
     @app.post('/experiments',dependencies=[Depends(operator)])
     def create(request:Request, csrf_token:str=Form(), name:str=Form(min_length=5,max_length=150), purpose:str=Form(), workloads:int=Form(), source:str=Form(), seed:int=Form(default=1729)):
         authorize(request,csrf_token)
-        if purpose not in {'pilot','main'} or source not in {'research','synthetic'} or not 2<=workloads<=cfg.max_workloads:
+        if purpose not in {'pilot','main'} or source not in {'pinned','research','synthetic'} or not 2<=workloads<=cfg.max_workloads:
             raise HTTPException(400,'Invalid protocol selection')
-        if cfg.mode=='live' and purpose=='main' and source!='research':
-            raise HTTPException(400,'Main live experiment requires source-backed research')
+        if cfg.mode=='live' and purpose=='main' and source=='synthetic':
+            raise HTTPException(400,'Main live experiment requires source-backed evidence')
         if cfg.mode=='local' and purpose=='main': raise HTTPException(400,'Local mode is replay only')
-        try: p=default_protocol(seed,workloads,purpose)
+        try: p=(cooldown_protocol if source=='pinned' else default_protocol)(seed,workloads,purpose)
         except ValueError: raise HTTPException(400,'Invalid workload count or seed') from None
         eid=str(uuid.uuid4())
         with db.tx() as s:
-            e=Experiment(id=eid,name=name.strip(),mode=cfg.mode,status='draft' if source=='synthetic' else 'researching',protocol=p.model_dump(mode='json'),protocol_hash=digest(p),remote={},summary={})
+            e=Experiment(id=eid,name=name.strip(),mode=cfg.mode,status='researching' if source=='research' else 'draft',protocol=p.model_dump(mode='json'),protocol_hash=digest(p),remote={},summary={})
             s.add(e);s.flush()
             db.audit(s,eid,'draft_created',purpose=purpose)
             if source=='research':
@@ -160,7 +160,7 @@ def create_app(cfg=None, db=None):
             audit=list(s.scalars(select(Audit).where(Audit.experiment_id==eid).order_by(Audit.id.desc()).limit(30))) if csrf(request) else []
             observed=s.scalar(select(func.count()).select_from(Workload).where(Workload.experiment_id==eid,Workload.phase=='observed'))
             return render(request,'detail.html',e=e,observed=observed,audit=audit,decision_hash=digest({'summary':e.summary,'protocol':e.protocol_hash}),
-                          expected_flag=cfg.flagsmith_flag)
+                          expected_flag=e.remote.get('flag_name', cfg.flagsmith_flag))
 
     @app.post('/experiments/{eid}/action',dependencies=[Depends(operator)])
     def action(eid:str,request:Request,csrf_token:str=Form(),action:str=Form(),approval_hash:str=Form(default='')):

@@ -19,6 +19,23 @@ class Family(StrEnum):
     PERSISTENT = 'persistent'
     SLOW = 'slow_response'
     CORRUPT = 'corrupt_response'
+    COOLDOWN_OVERLAP = 'cooldown_overlap'
+    COOLDOWN_BOUNDARY = 'cooldown_boundary'
+    HEALTHY_FIRST = 'healthy_workspace_first'
+    AFTER_COOLDOWN = 'after_cooldown'
+
+
+COOLDOWN_VARIANTS = {
+    'control': 'shared_cooldown',
+    'workspace_method_cooldown': 'workspace_method_cooldown',
+}
+COOLDOWN_SCENARIOS = (
+    (Family.HEALTHY, 20, 'Both workspaces are healthy.'),
+    (Family.COOLDOWN_OVERLAP, 40, 'B arrives early during A’s cooldown.'),
+    (Family.COOLDOWN_BOUNDARY, 15, 'B arrives close to the point where the cooldown consumes its deadline.'),
+    (Family.HEALTHY_FIRST, 15, 'B finishes before A receives a rate limit.'),
+    (Family.AFTER_COOLDOWN, 10, 'B arrives after A’s cooldown expires.'),
+)
 
 
 class Evidence(StrictModel):
@@ -62,7 +79,11 @@ class Protocol(StrictModel):
     scenarios: list[Scenario] = Field(min_length=2, max_length=7)
     assumptions: list[str] = Field(min_length=1, max_length=10)
     evidence: list[Evidence] = Field(default_factory=list, max_length=30)
-    policy_version: Literal['retry-v1'] = 'retry-v1'
+    policy_version: Literal['retry-v1', 'cooldown-v1'] = 'retry-v1'
+
+    @property
+    def cooldown(self) -> bool:
+        return self.policy_version == 'cooldown-v1'
 
     @model_validator(mode='after')
     def integrity(self):
@@ -71,6 +92,14 @@ class Protocol(StrictModel):
         known = {e.sha256 for e in self.evidence}
         if any(h not in known for s in self.scenarios for h in s.evidence_sha256):
             raise ValueError('Scenario refers to evidence outside this protocol')
+        if self.cooldown:
+            if {s.family for s in self.scenarios} != {f for f, _, _ in COOLDOWN_SCENARIOS}:
+                raise ValueError('Cooldown study requires the complete episode mix')
+            if not self.evidence or not all(s.evidence_sha256 for s in self.scenarios):
+                raise ValueError('Cooldown episodes require pinned evidence')
+            if self.purpose != 'pilot' and self.workloads < 100:
+                raise ValueError('Main/validation requires at least 100 episodes')
+            return self
         required = {Family.HEALTHY, Family.EXCESSIVE_HINT, Family.CORRUPT}
         if self.purpose != 'pilot' and (self.workloads < 100 or not required.issubset({s.family for s in self.scenarios})):
             raise ValueError('Main/validation requires >=100 workloads and healthy, excessive hint, corrupt guard cases')
@@ -92,3 +121,32 @@ def default_protocol(seed: int = 1729, workloads: int = 30, purpose: str = 'pilo
                                 (Family.EXCESSIVE_HINT, 5), (Family.PERSISTENT, 10), (Family.SLOW, 20), (Family.CORRUPT, 5)]],
         assumptions=['Independent workloads; read-only search requests; scenario weights are design assumptions.',
                      'Controlled transport is not a representative sample of actual SerpAPI service incidents.'])
+
+
+def cooldown_protocol(seed: int, workloads: int, purpose: str) -> Protocol:
+    """Build the reviewed source fixture. Hash the curated source URL and summary."""
+    sources = [
+        ('https://docs.slack.dev/apis/web-api/rate-limits/', 'Slack Web API rate limits',
+         'Slack describes Retry-After as scoped to the rate-limited workspace and method. The same method remains available to other workspaces.'),
+        ('https://github.com/slackapi/node-slack-sdk/blob/%40slack%2Fweb-api%407.16.0/packages/web-api/src/WebClient.ts#L686',
+         'Slack Node SDK v7.16.0 queue handling',
+         'The shared-client baseline models one WebClient queue pausing while it waits for Retry-After.'),
+    ]
+    evidence = [Evidence(source=url, title=title, excerpt=summary, stance='context',
+                         sha256=digest({'source': url, 'title': title, 'summary': summary}))
+                for url, title, summary in sources]
+    return Protocol(
+        seed=seed, workloads=workloads, purpose=purpose, policy_version='cooldown-v1',
+        deadline_ms=500, max_attempts=2,
+        hypothesis='Scoping cooldowns to a workspace and method improves verified 500 ms sync completion for healthy Workspace B without hurting Workspace A recovery.',
+        scenarios=[Scenario(family=family, weight=weight, rationale=rationale,
+                            evidence_sha256=[source.sha256 for source in evidence])
+                   for family, weight, rationale in COOLDOWN_SCENARIOS],
+        assumptions=[
+            'One episode is one independent assignment. Both workspaces call the same read-only method.',
+            'Scenario weights and arrival timings are benchmark assumptions. Upstream responses are served by FaultLab over HTTP.',
+            'Workspace B’s 500 ms target is a measurement threshold. Both policies can finish the read after it. Workspace A has 3 seconds to recover.',
+            'The shared queue is a model of the documented SDK behavior. No requests go to Slack.',
+            'Evidence hashes identify the curated URL and summary, and the SDK source is pinned to v7.16.0.',
+        ], evidence=evidence,
+    )

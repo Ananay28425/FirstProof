@@ -11,7 +11,7 @@ import re
 from urllib.parse import quote, urlsplit
 import httpx
 from .config import Settings
-from .contracts import Evidence, Proposal, Family
+from .contracts import COOLDOWN_VARIANTS, Evidence, Proposal, Family
 from .policies import execute, CONTROL, CANDIDATE, POLICIES
 
 
@@ -48,17 +48,35 @@ class FlagsmithAdmin:
         self.headers = {'Authorization': 'Api-Key '+cfg.flagsmith_admin_key.get_secret_value()}
 
     async def call(self, method, path, payload=None):
-        return await request_json(self.http, method, self.prefix+path, headers=self.headers, payload=payload)
+        try:
+            return await request_json(self.http, method, self.prefix+path, headers=self.headers, payload=payload)
+        except IntegrationError as exc:
+            raise IntegrationError(f'Flagsmith {method} {path}: {exc}') from None
 
     async def warehouses(self):
         return await self.call('GET', 'warehouse-connections/')
 
-    async def create_metric(self, event):
-        """Occurrence avoids inflating the primary metric through repeated logical events."""
-        return await self.call('POST', 'experiment-metrics/', {'name': event, 'aggregation':'occurrence','direction':'up','definition':{'version':1,'event':event}})
+    async def create_metric(self, event, *, numeric=False):
+        return await self.call('POST', 'experiment-metrics/', {
+            'name': event, 'aggregation': 'mean' if numeric else 'occurrence',
+            'direction': 'down' if numeric else 'up', 'definition': {'version': 1, 'event': event},
+        })
 
-    async def create_experiment(self, name, hypothesis, metric_id):
-        return await self.call('POST','experiments/', {'feature':self.cfg.flagsmith_feature_id,'name':name,'hypothesis':hypothesis,'metrics':[{'metric':metric_id,'expected_direction':'increase'}], 'experiment_rollout':{'enabled':True,'rollout_percentage':100,'feature_state_value':{'type':'string','value':CONTROL},'multivariate_feature_state_values':[{'multivariate_feature_option':self.cfg.flagsmith_candidate_id,'percentage_allocation':50}]}})
+    async def create_experiment(self, name, hypothesis, metric_id, *, cooldown=False, latency_metric_id=None):
+        metrics = [{'metric': metric_id, 'expected_direction': 'increase'}]
+        if latency_metric_id is not None:
+            metrics.append({'metric': latency_metric_id, 'expected_direction': 'decrease'})
+        return await self.call('POST', 'experiments/', {
+            'feature': self.cfg.flagsmith_feature_id, 'name': name, 'hypothesis': hypothesis,
+            'metrics': metrics,
+            'experiment_rollout': {
+                'enabled': True, 'rollout_percentage': 100,
+                'feature_state_value': {'type': 'string', 'value': COOLDOWN_VARIANTS[CONTROL] if cooldown else CONTROL},
+                'multivariate_feature_state_values': [
+                    {'multivariate_feature_option': self.cfg.flagsmith_candidate_id, 'percentage_allocation': 50},
+                ],
+            },
+        })
 
     async def inspect(self, experiment_id):
         return await self.call('GET', f'experiments/{int(experiment_id)}/')
@@ -96,7 +114,7 @@ class NativeRuntime:
         options = {'environment_key':key.get_secret_value(), 'api_url':cfg.flagsmith_api_url, 'enable_events':not release, 'request_timeout_seconds': 5}
         if not release:
             # Match documented self-hosted ingestion endpoint, not the cloud default.
-            event_options = {'max_buffer_items': 1}
+            event_options = {}
             if cfg.flagsmith_events_url:
                 event_options['events_api_url'] = cfg.flagsmith_events_url
             options['event_processor_config'] = EventProcessorConfig(**event_options)
@@ -106,7 +124,7 @@ class NativeRuntime:
         async with self.lock:
             return await asyncio.to_thread(fn, *args, **kwargs)
 
-    async def evaluate(self, identity, experiment_id):
+    async def evaluate(self, identity, experiment_id, *, cooldown=False):
         """Non-exposure evaluation verifies enrollment and exact experiment before use."""
         flags = await self._call(self.sdk.get_identity_flags, identity)
         flag = flags.get_flag(self.flag)
@@ -119,9 +137,10 @@ class NativeRuntime:
         if native_id is None or str(native_id) != str(experiment_id):
             raise IntegrationError('Native experiment identity mismatch; inspect installed SDK contract')
         value, variant = getattr(flag,'value',None), getattr(flag,'variant',None)
-        if not flag.enabled or value not in POLICIES or variant != value:
+        expected_values = COOLDOWN_VARIANTS if cooldown else {p: p for p in POLICIES}
+        if not flag.enabled or variant not in expected_values or expected_values[variant] != value:
             raise IntegrationError('Unexpected flag value or variant key')
-        return value
+        return variant
 
     async def expose(self, identity, variant, experiment_id):
         """Record the actual experienced variation, using explicit experiment metadata."""
@@ -129,6 +148,9 @@ class NativeRuntime:
 
     async def conversion(self, identity, event):
         await self._call(self.sdk.track_event, event, identifier=identity)
+
+    async def numeric_event(self, identity, event, value):
+        await self._call(self.sdk.track_event, event, identifier=identity, value=value)
 
     async def flush(self):
         await self._call(self.sdk.flush_events)
@@ -146,8 +168,9 @@ class NativeRuntime:
 
 class LocalReplay:
     """Explicit test double. No network flag operations or native statistical results."""
-    async def evaluate(self, identity, experiment_id):
-        return (CONTROL,CANDIDATE)[int(hashlib.sha256(identity.encode()).hexdigest(),16)%2]
+    async def evaluate(self, identity, experiment_id, *, cooldown=False):
+        variants = tuple(COOLDOWN_VARIANTS) if cooldown else (CONTROL, CANDIDATE)
+        return variants[int(hashlib.sha256(identity.encode()).hexdigest(),16)%2]
     async def expose(self, *args): pass
     async def conversion(self, *args): pass
     async def flush(self): pass
@@ -253,14 +276,15 @@ async def propose(cfg, http, question, evidence):
 
 
 
-def reconcile_native(raw: dict, summary: dict, metric_id: int, exposures: dict | None = None) -> dict:
+def reconcile_native(raw: dict, summary: dict, metric_id: int, exposures: dict | None = None,
+                     *, cooldown=False, verified_equal_split=False) -> dict:
     """Strict adapter for Flagsmith's ResultsSummary / VariantStats / Inference wire schema.
 
     Matching aggregate counts is necessary, not proof of per-identity reconciliation.
     Dedicated environment, unique conversion name and exact SDK enrollment checks
     reduce the attribution risk; quarantine counts are required too.
     """
-    from math import isfinite
+    from math import erfc, isfinite, sqrt
     try:
         wrapper = raw['results']
         if wrapper['last_error_at'] or not wrapper['as_of']:
@@ -268,21 +292,44 @@ def reconcile_native(raw: dict, summary: dict, metric_id: int, exposures: dict |
         payload = wrapper['payload']
         metric = next(m for m in payload['metrics'] if m['metric_id'] == metric_id)
         groups = metric['variants']
-        if set(groups) != POLICIES:
+        variants = tuple(COOLDOWN_VARIANTS) if cooldown else (CONTROL, CANDIDATE)
+        if set(groups) != set(variants):
             raise ValueError('Unexpected native variations')
-        matched = all(groups[k]['n'] == summary['groups'][k]['n'] and groups[k]['sum'] == summary['groups'][k]['successes'] for k in POLICIES)
-        inference = metric['inference'].get(CANDIDATE)
+        matched = all(groups[k]['n'] == summary['groups'][k]['n'] and groups[k]['sum'] == summary['groups'][k]['successes'] for k in variants)
+        inference = metric['inference'].get(variants[1])
         p = float(inference['chance_to_win']) if inference else 0.0
         ci = [float(inference['ci_low']),float(inference['ci_high'])] if inference else None
         srm = payload['srm_p_value']
-        if not 0 <= p <= 1 or (ci and not all(isfinite(v) for v in ci)):
+        if not 0 <= p <= 1 or (ci and (not all(isfinite(v) for v in ci) or ci[0] > ci[1])):
             raise ValueError('Invalid inference values')
+        if srm is not None and (type(srm) not in (float, int) or not 0 <= srm <= 1):
+            raise ValueError('Invalid native sample ratio check')
         # Missing exclusions data must not unlock a release.
         ex = (exposures or {})['exposures']
         excluded = ex['payload']['excluded_identities']
         matched = matched and excluded == 0 and not ex['last_error_at']
+        independent_srm = None
+        if cooldown:
+            points = ex['payload']['timeseries']['points']
+            exposure_totals = {k: 0 for k in variants}
+            for point in points:
+                for key, count in point['new_identities'].items():
+                    if type(count) is not int or count < 0:
+                        raise ValueError('Invalid native exposure count')
+                    exposure_totals[key] += count
+            matched = matched and bool(ex['as_of']) and all(
+                exposure_totals[k] == summary['groups'][k]['n'] for k in variants
+            )
+            total = sum(exposure_totals.values())
+            if srm is None and verified_equal_split and matched and total >= 100:
+                # Two equal arms give a Pearson chi-square statistic with one degree of freedom.
+                # Use the reconciled warehouse exposures and the active rollout, not default weights.
+                gap = abs(exposure_totals[variants[0]] - exposure_totals[variants[1]])
+                independent_srm = erfc(gap / sqrt(2 * total))
+        srm_check = srm if srm is not None else independent_srm
         return {'reconciled': bool(matched), 'win_probability': p, 'credible_interval': ci,
-                'srm_warning': srm is None or srm < .001, 'excluded': excluded,
+                'srm_warning': srm_check is None or srm_check < .001,
+                'srm_p_value': srm, 'independent_srm_p_value': independent_srm, 'excluded': excluded,
                 'as_of': wrapper['as_of'], 'final': wrapper.get('is_final',False),
                 'counts': groups, 'status': 'matched_aggregate_counts' if matched else 'count_mismatch'}
     except (KeyError, TypeError, ValueError, StopIteration, AttributeError):
